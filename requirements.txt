@@ -1,0 +1,7 @@
+pystray
+pillow
+psutil
+nvidia-ml-py
+win10toast
+keyboard
+pywin32
