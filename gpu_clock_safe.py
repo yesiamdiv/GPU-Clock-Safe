@@ -34,10 +34,16 @@ except Exception:
     psutil = None
 
 try:
-    import pynvml
+    from pynvml import nvmlInit, nvmlDeviceGetHandleByIndex, nvmlDeviceGetTemperature, nvmlShutdown, NVML_TEMPERATURE_GPU
     PYNVML_AVAILABLE = True
-except Exception:
-    pynvml = None
+    logging.info("pynvml loaded successfully")
+except ImportError:
+    nvmlInit = nvmlDeviceGetHandleByIndex = nvmlDeviceGetTemperature = nvmlShutdown = None
+    NVML_TEMPERATURE_GPU = None
+    PYNVML_AVAILABLE = False
+    logging.warning("pynvml not available - temperature reading via NVML disabled")
+except Exception as e:
+    logging.exception(f"Failed to initialize pynvml: {e}")
     PYNVML_AVAILABLE = False
 
 try:
@@ -94,6 +100,8 @@ stop_event = threading.Event()
 nvml_handle = None
 current_mode = None
 elevated = False
+notification_queue = []
+notification_lock = threading.Lock()
 
 
 # -------------------------
@@ -102,23 +110,22 @@ elevated = False
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
-    except Exception:
+    except:
         return False
-
 
 def relaunch_as_admin():
-    """Relaunch the current python interpreter elevated."""
     if is_admin():
         return True
-    # Build the command line
-    params = " ".join([f'"{x}"' for x in sys.argv])
     try:
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
-        return False
+        # This is the correct way to relaunch with admin rights
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, " ".join(sys.argv), None, 1
+        )
+        return False  # We relaunched → exit current process
     except Exception as e:
         logger.exception("Failed to elevate: %s", e)
+        messagebox.showerror("Admin Required", "This app requires administrator privileges.")
         return False
-
 
 def load_settings():
     global settings
@@ -131,11 +138,9 @@ def load_settings():
     else:
         settings = DEFAULT_SETTINGS.copy()
         save_settings()
-    # ensure defaults present
     for k, v in DEFAULT_SETTINGS.items():
         settings.setdefault(k, v)
     logger.info("Settings loaded: %s", settings)
-
 
 def save_settings():
     try:
@@ -145,23 +150,68 @@ def save_settings():
     except Exception as e:
         logger.exception("Failed to save settings: %s", e)
 
-
 def notify(title, msg):
-    if settings.get("show_notifications", True) and TOASTER_AVAILABLE:
-        try:
-            global toaster
-            if toaster is None:
-                toaster = ToastNotifier()
-            toaster.show_toast(title, msg, threaded=True, icon_path=settings.get("icon_path") or None, duration=4)
-        except Exception:
-            logger.exception("Notification failed")
-    else:
+    """
+    FIX: Queue notifications and process them serially to avoid
+    win10toast threading issues with classAtom attribute.
+    """
+    if not settings.get("show_notifications", True):
         logger.info("Notification: %s - %s", title, msg)
+        return
+    
+    if not TOASTER_AVAILABLE:
+        logger.info("Notification: %s - %s", title, msg)
+        return
+    
+    # Queue the notification
+    with notification_lock:
+        notification_queue.append((title, msg))
 
+def notification_worker():
+    """
+    Dedicated thread to process notifications serially.
+    This prevents win10toast threading issues.
+    """
+    global toaster
+    logger.info("Notification worker thread started")
+    
+    while not stop_event.is_set():
+        try:
+            # Check for queued notifications
+            notification = None
+            with notification_lock:
+                if notification_queue:
+                    notification = notification_queue.pop(0)
+            
+            if notification:
+                title, msg = notification
+                try:
+                    # Initialize toaster once
+                    if toaster is None:
+                        toaster = ToastNotifier()
+                    
+                    # Show toast WITHOUT threaded=True to avoid nested threading
+                    toaster.show_toast(
+                        title,
+                        msg,
+                        threaded=False,  # FIX: Don't use threaded mode
+                        icon_path=settings.get("icon_path") or None,
+                        duration=4
+                    )
+                except Exception as e:
+                    logger.exception(f"Notification failed: {e}")
+                    # Reset toaster on error
+                    toaster = None
+            else:
+                # No notifications, sleep briefly
+                time.sleep(0.2)
+                
+        except Exception as e:
+            logger.exception(f"Notification worker error: {e}")
+            time.sleep(1)
+    
+    logger.info("Notification worker thread exiting")
 
-# -------------------------
-# NVIDIA / nvidia-smi helpers
-# -------------------------
 def run_cmd(cmd):
     try:
         out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, text=True)
@@ -173,21 +223,14 @@ def run_cmd(cmd):
         logger.warning("Command not found: %s", cmd)
         return None
 
-
-def nvidia_smi_available():
-    return run_cmd("nvidia-smi -L") is not None
-
-
 def set_gpu_clock(core_mhz):
-    # Note: -lgc expects min,max; we set same same for locking
     cmd = f'nvidia-smi -lgc {core_mhz},{core_mhz}'
     out = run_cmd(cmd)
     if out is None:
-        notify("GPUClockSafe", f"Failed to set clock to {core_mhz} MHz (nvidia-smi failed)")
+        notify("GPUClockSafe", f"Failed to set clock to {core_mhz} MHz")
         return False
     logger.info("Set GPU clock to %d MHz", core_mhz)
     return True
-
 
 def restore_gpu_defaults():
     run_cmd("nvidia-smi -rgc")
@@ -195,19 +238,16 @@ def restore_gpu_defaults():
     logger.info("Restored GPU clock defaults")
     notify("GPUClockSafe", "GPU clocks restored to defaults")
 
-
 def get_gpu_temp():
-    # Try NVML first for better accuracy
     if PYNVML_AVAILABLE:
         try:
             if nvml_handle is None:
-                pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                nvmlInit()
+            handle = nvmlDeviceGetHandleByIndex(0)
+            temp = nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
             return int(temp)
         except Exception:
             logger.exception("pynvml read failed")
-    # Fallback to nvidia-smi query
     out = run_cmd('nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits')
     if out:
         try:
@@ -216,32 +256,14 @@ def get_gpu_temp():
             logger.exception("nvidia-smi parsing failed")
     return None
 
-
-def get_vram_total():
-    out = run_cmd('nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits')
-    if out:
-        try:
-            val = int(out.strip().splitlines()[0].strip())
-            # value in MiB -> convert to GiB approx
-            return val // 1024
-        except Exception:
-            logger.exception("Failed parsing vram")
-    return None
-
-
 def is_on_ac_power():
     if psutil is None:
         return True
     bat = psutil.sensors_battery()
     if bat is None:
-        # Desktop or unknown; assume AC
         return True
     return bool(bat.power_plugged)
 
-
-# -------------------------
-# Mode control
-# -------------------------
 def set_mode_normal():
     global current_mode
     mhz = settings.get("battery_mhz", DEFAULT_SETTINGS["battery_mhz"])
@@ -250,7 +272,6 @@ def set_mode_normal():
         current_mode = "Normal"
         notify(APP_NAME, f"Switched to Normal mode ({mhz} MHz)")
     return ok
-
 
 def set_mode_balanced():
     global current_mode
@@ -261,21 +282,16 @@ def set_mode_balanced():
         notify(APP_NAME, f"Switched to Balanced mode ({mhz} MHz)")
     return ok
 
-
 def set_mode_boost(force=False):
     global current_mode
-    # safety checks: battery / temp
     if not force and not is_on_ac_power():
         notify(APP_NAME, "Boost mode blocked: running on battery")
-        logger.info("Boost blocked on battery")
         return False
-    # temp checks
     temp = get_gpu_temp()
     if temp is not None:
         thr = settings.get("temp_threshold_boost", DEFAULT_SETTINGS["temp_threshold_boost"])
         if temp >= thr:
             notify(APP_NAME, f"Boost blocked: GPU temp {temp}°C >= {thr}°C")
-            logger.info("Boost blocked due to temp: %d >= %d", temp, thr)
             return False
     mhz = settings.get("boost_mhz", DEFAULT_SETTINGS["boost_mhz"])
     ok = set_gpu_clock(mhz)
@@ -358,7 +374,7 @@ class MainApp:
     def __init__(self, root):
         self.root = root
         self.root.title(APP_NAME)
-        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)  # hide instead of quit
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.geometry("520x340")
         self.icon_image = None
         self.setup_ui()
@@ -367,7 +383,6 @@ class MainApp:
         self.tray_running = False
 
     def setup_ui(self):
-        # Top menu: Edit
         menubar = tk.Menu(self.root)
         editmenu = tk.Menu(menubar, tearoff=0)
         editmenu.add_command(label="Settings", command=self.open_settings_window)
@@ -377,14 +392,12 @@ class MainApp:
         menubar.add_cascade(label="Edit", menu=editmenu)
         self.root.config(menu=menubar)
 
-        # Main controls
         frm = ttk.Frame(self.root, padding=12)
         frm.pack(fill="both", expand=True)
 
         lbl = ttk.Label(frm, text="GPU Clock Safe", font=("Segoe UI", 18, "bold"))
         lbl.pack(pady=(0, 10))
 
-        # Current mode label
         self.mode_var = tk.StringVar(value="Unknown")
         ttk.Label(frm, textvariable=self.mode_var, font=("Segoe UI", 12)).pack()
 
@@ -395,7 +408,6 @@ class MainApp:
         ttk.Button(btn_frame, text="Balanced Mode (stable)", command=self.on_balanced).pack(fill="x", padx=6, pady=6)
         ttk.Button(btn_frame, text="Boost Mode (risky)", command=self.on_boost).pack(fill="x", padx=6, pady=6)
 
-        # options
         self.auto_temp_var = tk.BooleanVar(value=settings.get("auto_temp_mode", False))
         chk = ttk.Checkbutton(frm, text="Enable auto temperature mode", variable=self.auto_temp_var,
                               command=self.on_toggle_auto_temp)
@@ -410,7 +422,6 @@ class MainApp:
         chk3 = ttk.Checkbutton(frm, text="Show notifications", variable=self.notif_var, command=self.on_toggle_notif)
         chk3.pack(pady=2)
 
-        # icon preview
         ttk.Separator(frm).pack(fill="x", pady=10)
         ip_frame = ttk.Frame(frm)
         ip_frame.pack(fill="x")
@@ -421,7 +432,6 @@ class MainApp:
         self.update_mode_label()
         self.load_icon_preview()
 
-        # bottom: log button
         ttk.Button(frm, text="Open log file", command=lambda: os.startfile(LOG_FILE)).pack(side="bottom", pady=6)
 
     def update_mode_label(self):
@@ -561,37 +571,26 @@ class MainApp:
 
     def create_tray(self):
         if not PYSTRAY_AVAILABLE:
-            logger.info("pystray not available, skipping tray creation")
             return
 
-        def on_open(_icon, _item):
-            self.show_window()
+        def safe_call(func):
+            def wrapper(icon, item):
+                self.root.after(0, func)
+            return wrapper
 
-        def on_quit(_icon, _item):
-            # stop everything and quit
-            stop_app()
-
-        def on_normal_item(_icon, _item):
-            set_mode_normal()
-            self.update_mode_label()
-
-        def on_bal_item(_icon, _item):
-            set_mode_balanced()
-            self.update_mode_label()
-
-        def on_boost_item(_icon, _item):
-            set_mode_boost()
-            self.update_mode_label()
+        def dummy(*args, **kwargs):
+            pass
 
         menu = Menu(
-            Item('Open', on_open),
-            Item('Normal Mode', on_normal_item),
-            Item('Balanced Mode', on_bal_item),
-            Item('Boost Mode', on_boost_item),
-            Item('---', lambda: None),
-            Item('Settings', lambda _i, _j: self.show_window()),
-            Item('Exit & Restore', on_quit),
+            Item('Open GPU Clock Safe', safe_call(self.show_window)),
+            Item('Normal Mode', safe_call(self.on_normal)),
+            Item('Balanced Mode', safe_call(self.on_balanced)),
+            Item('Boost Mode', safe_call(self.on_boost)),
+            Item(Menu.SEPARATOR, dummy),
+            Item('Settings', safe_call(self.show_window)),
+            Item('Exit & Restore Clocks', safe_call(self.exit_and_restore)),
         )
+
         icon_img = self._make_icon_image()
         self.tray_icon = pystray.Icon("gpu_clock_safe", icon_img, APP_NAME, menu)
 
@@ -599,8 +598,8 @@ class MainApp:
             self.tray_running = True
             try:
                 self.tray_icon.run()
-            except Exception:
-                logger.exception("Tray thread failed")
+            except Exception as e:
+                logger.exception(f"Tray crashed: {e}")
             finally:
                 self.tray_running = False
 
@@ -624,15 +623,12 @@ class MainApp:
 # Startup shortcut
 # -------------------------
 def set_startup(enable):
-    # create shortcut in user's startup folder (for current user)
     startup_folder = Path(os.getenv('APPDATA')) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
     startup_folder.mkdir(parents=True, exist_ok=True)
     exe_path = Path(sys.executable) if getattr(sys, "frozen", False) else Path(sys.argv[0]).resolve()
     shortcut_path = startup_folder / f"{APP_NAME}.lnk"
     if enable:
-        # Use Windows shell via comtypes or power-shell fallback
         try:
-            # Try using Python + ctypes COM via winshell (not using extra libs here)
             import pythoncom
             from win32com.shell import shell, shellcon
             shell_link = pythoncom.CoCreateInstance(shell.CLSID_ShellLink, None,
@@ -642,13 +638,11 @@ def set_startup(enable):
             persist_file = shell_link.QueryInterface(pythoncom.IID_IPersistFile)
             persist_file.Save(str(shortcut_path), 0)
         except Exception:
-            # As fallback, write a .bat in startup that launches app
             bat = startup_folder / f"{APP_NAME}.bat"
             with open(bat, "w", encoding="utf-8") as f:
                 f.write(f'@echo off\nstart "" "{exe_path}"\n')
             logger.info("Created startup .bat at %s", bat)
     else:
-        # remove both potential shortcut and bat
         for p in [shortcut_path, startup_folder / f"{APP_NAME}.bat"]:
             try:
                 if p.exists():
@@ -664,83 +658,103 @@ def set_startup(enable):
 def stop_app():
     logger.info("Stopping app")
     stop_event.set()
-    # restore clocks
     try:
         restore_gpu_defaults()
     except Exception:
         logger.exception("Restore failed")
-    # stop tray
     try:
         if mainapp.tray_running:
             mainapp.stop_tray()
     except Exception:
         pass
-    # exit python main loop
     try:
         mainapp.root.quit()
     except Exception:
         pass
     logger.info("App stopped")
 
+def handle_single_instance():
+    """
+    Returns True if another instance is already running.
+    """
+    import ctypes
+    try:
+        import win32gui, win32con
+        WIN32_AVAILABLE = True
+    except:
+        WIN32_AVAILABLE = False
+
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "GPUClockSafeSingletonMutex")
+    already = (ctypes.windll.kernel32.GetLastError() == 183)
+
+    if already:
+        if WIN32_AVAILABLE:
+            try:
+                hwnd = win32gui.FindWindow(None, "GPU Clock Safe")
+                if hwnd:
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                    win32gui.SetForegroundWindow(hwnd)
+            except:
+                pass
+
+        notify("GPU Clock Safe", "The app is already running.")
+        return True
+
+    return False
+
 
 def main():
     global mainapp, nvml_handle, elevated
 
-    # Auto-elevate if not admin (necessary for nvidia-smi clock locking)
-    if not is_admin():
-        ok = relaunch_as_admin()
-        if not ok:
-            messagebox.showerror("GPU Clock Safe", "This app needs administrator privileges to manage GPU clocks.")
-            # continue but warn user
-    else:
-        elevated = True
+    if handle_single_instance():
+        return
 
+    if not is_admin():
+        if not relaunch_as_admin():
+            return
+        else:
+            return
+
+    elevated = True
     load_settings()
 
-    # init nvml if available
     if PYNVML_AVAILABLE:
         try:
-            pynvml.nvmlInit()
+            nvmlInit()
+            nvml_handle = nvmlDeviceGetHandleByIndex(0)
         except Exception:
-            logger.exception("nvml init failed")
+            logger.exception("NVML initialization failed")
 
-    # create GUI root
     root = tk.Tk()
-    global mainapp
     mainapp = MainApp(root)
 
-    # Show tray icon
     if PYSTRAY_AVAILABLE:
         mainapp.create_tray()
 
-    # Start threads
-    t_auto = threading.Thread(target=auto_temp_loop, daemon=True)
-    t_auto.start()
+    threading.Thread(target=auto_temp_loop, daemon=True).start()
+    threading.Thread(target=hotkey_worker, daemon=True).start()
+    
+    # FIX: Start notification worker thread
+    if TOASTER_AVAILABLE:
+        threading.Thread(target=notification_worker, daemon=True).start()
 
-    t_hot = threading.Thread(target=hotkey_worker, daemon=True)
-    t_hot.start()
-
-    # If start_on_boot was set, ensure startup
     if settings.get("start_on_boot", False):
         try:
             set_startup(True)
-        except Exception:
-            logger.exception("Failed ensuring startup")
+        except:
+            logger.exception("Failed setting startup")
 
-    # Attempt to set balanced on start for safety
     try:
         set_mode_balanced()
     except Exception:
-        logger.exception("Failed initial balanced set")
+        logger.exception("Failed initial balanced mode")
 
-    # start tkinter mainloop (this blocks)
     try:
         root.mainloop()
     except KeyboardInterrupt:
         pass
     finally:
         stop_app()
-
 
 if __name__ == "__main__":
     main()
