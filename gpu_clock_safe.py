@@ -494,7 +494,7 @@ class MainApp:
         ttk.Button(w, text="Save", command=save_and_close).pack(pady=12)
 
     def choose_icon(self):
-        p = filedialog.askopenfilename(title="Choose tray icon PNG (prefer 64x64)", filetypes=[("PNG files", "*.png"), ("All", "*.*")])
+        p = filedialog.askopenfilename(title="Choose tray icon  (prefer 64x64)", filetypes=[("ICO files", "*.ico"), ("All", "*.*")])
         if not p:
             return
         settings["icon_path"] = p
